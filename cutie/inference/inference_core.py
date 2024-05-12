@@ -10,7 +10,7 @@ from cutie.inference.memory_manager import MemoryManager
 from cutie.inference.object_manager import ObjectManager
 from cutie.inference.image_feature_store import ImageFeatureStore
 from cutie.model.cutie import CUTIE
-from cutie.utils.tensor_utils import pad_divide_by, unpad, aggregate
+from cutie.utils.tensor_utils import pad_divide_by, unpad, aggregate, batched_pad_divide_by
 
 log = logging.getLogger()
 
@@ -139,11 +139,6 @@ class InferenceCore:
         Returns: (num_objects+1)*H*W normalized probability; the first channel is the background
         """
         bs = key.shape[0]
-        if self.flip_aug:
-            assert bs == 2
-        else:
-            assert bs == 1
-
         if not self.memory.engaged:
             log.warn('Trying to segment without any memory!')
             return torch.zeros((1, key.shape[-2] * 16, key.shape[-1] * 16),
@@ -158,12 +153,7 @@ class InferenceCore:
                                                                  self.object_manager.all_obj_ids),
                                                              chunk_size=self.chunk_size,
                                                              update_sensory=update_sensory)
-        # remove batch dim
-        if self.flip_aug:
-            # average predictions of the non-flipped and flipped version
-            pred_prob_with_bg = (pred_prob_with_bg[0] +
-                                 torch.flip(pred_prob_with_bg[1], dims=[-1])) / 2
-        else:
+        if bs ==1:
             pred_prob_with_bg = pred_prob_with_bg[0]
         if update_sensory:
             self.memory.update_sensory(sensory, self.object_manager.all_obj_ids)
@@ -327,6 +317,63 @@ class InferenceCore:
                                         align_corners=False)[0]
 
         return output_prob
+    
+    def step_multi(self,
+                image: torch.Tensor,
+                mask: Optional[torch.Tensor] = None,
+                objects: Optional[List[int]] = None,
+                *,
+                idx_mask: bool = True,
+                end: bool = False,
+                delete_buffer: bool = True,
+                force_permanent: bool = False) -> torch.Tensor:
+            
+            # resize input if needed -- currently only used for the GUI
+            self.curr_ti += 1
+            image, self.pad = batched_pad_divide_by(image, 16)
+
+            # whether to update the working memory
+            is_mem_frame = ((self.curr_ti - self.last_mem_ti >= self.mem_every) or
+                            (mask is not None)) and (not end)
+            # segment when there is no input mask or when the input mask is incomplete
+            need_segment = (mask is None) or (self.object_manager.num_obj > 0
+                                            and not self.object_manager.has_all(objects))
+            update_sensory = ((self.curr_ti - self.last_mem_ti) in self.stagger_ti) and (not end)
+
+            # encoding the image
+            ms_feat, pix_feat = self.image_feature_store.get_features(self.curr_ti, image)
+            key, shrinkage, selection = self.image_feature_store.get_key(self.curr_ti, image)
+            
+            if need_segment:
+                pred_prob_with_bg = self._segment(key,
+                                                selection,
+                                                pix_feat,
+                                                ms_feat,
+                                                update_sensory=update_sensory)
+            if mask is not None:
+                corresponding_tmp_ids, _ = self.object_manager.add_new_objects(objects)
+                mask, _ = batched_pad_divide_by(mask, 16)
+                mask = torch.stack([mask[:] == objects[mask_id] for mask_id, _ in enumerate(corresponding_tmp_ids)],dim=1)
+                pred_prob_with_bg = aggregate(mask, dim=1)                  # (bs, 3, H, W)
+                pred_prob_with_bg = torch.softmax(pred_prob_with_bg, dim=1) # (bs, 3, H, W)
+                
+            self.last_mask = pred_prob_with_bg[:,1:]
+            
+            # save as memory if needed
+            if is_mem_frame or force_permanent:
+                self._add_memory(image,
+                                pix_feat,
+                                self.last_mask,
+                                key,
+                                shrinkage,
+                                selection,
+                                force_permanent=force_permanent)
+
+            if delete_buffer:
+                self.image_feature_store.delete(self.curr_ti)
+
+            output_prob = unpad(pred_prob_with_bg, self.pad)
+            return output_prob
 
     def delete_objects(self, objects: List[int]) -> None:
         """

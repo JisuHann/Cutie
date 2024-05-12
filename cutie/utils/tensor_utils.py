@@ -22,6 +22,27 @@ def pad_divide_by(in_img: torch.Tensor, d: int) -> (torch.Tensor, Iterable[int])
     return out, pad_array
 
 
+# STM
+def batched_pad_divide_by(in_img: torch.Tensor, d: int) -> (torch.Tensor, Iterable[int]):
+    h, w = in_img.shape[-2:]
+
+    if h % d > 0:
+        new_h = h + d - h % d
+    else:
+        new_h = h
+    if w % d > 0:
+        new_w = w + d - w % d
+    else:
+        new_w = w
+    lh, uh = int((new_h - h) / 2), int(new_h - h) - int((new_h - h) / 2)
+    lw, uw = int((new_w - w) / 2), int(new_w - w) - int((new_w - w) / 2)
+    pad_array = (int(lw), int(uw), int(lh), int(uh))
+    out= []
+    for in_img_i in in_img:
+        out.append(F.pad(in_img_i, pad_array))
+    out = torch.stack(out)
+    return out, pad_array
+
 def unpad(img: torch.Tensor, pad: Iterable[int]) -> torch.Tensor:
     if len(img.shape) == 4:
         if pad[2] + pad[3] > 0:
